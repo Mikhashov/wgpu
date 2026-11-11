@@ -1,5 +1,5 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::{cmp::max, num::NonZeroU64, ops::Range, sync::atomic::Ordering};
+use core::{cmp::max, num::NonZeroU64, sync::atomic::Ordering};
 
 use wgt::{math::align_to, BufferUsages, BufferUses, Features};
 
@@ -42,9 +42,8 @@ struct UnsafeTlasStore<'a> {
 
 struct TlasStore<'a> {
     internal: UnsafeTlasStore<'a>,
-    /// The instances' bytes in the staging buffer, and where they go in the instance buffer.
-    range: Range<usize>,
-    offset: u64,
+    /// The instances' bytes in the staging buffer to the instance buffer.
+    uploads: Vec<hal::BufferCopy>,
     /// Update the structure in place instead of building it.
     update: bool,
 }
@@ -186,26 +185,27 @@ impl Global {
                         && tlas
                             .flags
                             .contains(wgt::AccelerationStructureFlags::ALLOW_UPDATE);
+                    let identity = changes
+                        .as_ref()
+                        .map_or((0, 0), |changes| (changes.source, changes.seq));
                     // The changed instances alone, where that build was the
                     // caller's previous one.
-                    let dirty = changes
-                        .as_ref()
-                        .filter(|changes| {
-                            in_order
-                                && changes.source == retained.source
-                                && changes.seq == retained.seq.wrapping_add(1)
-                                && changes.dirty.end as usize <= retained.slots()
-                        })
-                        .map(|changes| {
-                            let dirty = &changes.dirty;
-                            dirty.start as usize..dirty.end.max(dirty.start) as usize
-                        });
-                    let all = 0..usize::MAX;
-                    let taken = dirty.as_ref().unwrap_or(&all);
-                    let instances: Vec<_> = tlas_package
-                        .instances
-                        .skip(taken.start)
-                        .take(taken.len())
+                    let changes = changes.filter(|changes| {
+                        let dirty = &changes.dirty;
+                        in_order
+                            && changes.source == retained.source
+                            && changes.seq == retained.seq.wrapping_add(1)
+                            && dirty.iter().all(|range| range.start < range.end)
+                            && dirty.windows(2).all(|pair| pair[0].end <= pair[1].start)
+                            && dirty
+                                .last()
+                                .is_none_or(|range| range.end as usize <= retained.slots())
+                    });
+                    let (dirty, taken) = match changes {
+                        Some(changes) => (Some(changes.dirty), changes.instances),
+                        None => (None, tlas_package.instances),
+                    };
+                    let instances: Vec<_> = taken
                         .map(|instance| {
                             instance
                                 .as_ref()
@@ -220,10 +220,8 @@ impl Global {
                                 .transpose()
                         })
                         .collect::<Result<_, BuildAccelerationStructureError>>()?;
-                    let build =
-                        retained.apply(&tlas, taken.start, &instances, dirty.is_some(), update);
-                    (retained.source, retained.seq) =
-                        changes.map_or((0, 0), |changes| (changes.source, changes.seq));
+                    let build = retained.apply(&tlas, dirty.as_deref(), &instances, update);
+                    (retained.source, retained.seq) = identity;
                     *tlas.retained.lock() = retained;
                     Ok(ArcTlasPackage {
                         tlas,
@@ -277,9 +275,8 @@ pub(crate) fn build_acceleration_structures(
             None => {
                 let build = crate::ray_tracing::TlasRetained::default().apply(
                     tlas,
-                    0,
+                    None,
                     &package.instances,
-                    false,
                     false,
                 );
                 *tlas.retained.lock() = Default::default();
@@ -362,8 +359,17 @@ pub(crate) fn build_acceleration_structures(
                 ),
                 scratch_buffer_offset,
             },
-            range: first_byte_index..instance_buffer_staging_source.len(),
-            offset: build.offset,
+            uploads: build
+                .uploads
+                .iter()
+                .filter_map(|(offset, range)| {
+                    Some(hal::BufferCopy {
+                        src_offset: (first_byte_index + range.start) as u64,
+                        dst_offset: *offset,
+                        size: wgt::BufferSize::new(range.len() as u64)?,
+                    })
+                })
+                .collect(),
             update: build.update,
         });
     }
@@ -473,15 +479,13 @@ pub(crate) fn build_acceleration_structures(
         let mut instance_buffer_barriers = Vec::new();
         for &TlasStore {
             internal: UnsafeTlasStore { ref tlas, .. },
-            ref range,
-            offset,
+            ref uploads,
             ..
         } in &tlas_storage
         {
-            let size = match wgt::BufferSize::new((range.end - range.start) as u64) {
-                None => continue,
-                Some(size) => size,
-            };
+            if uploads.is_empty() {
+                continue;
+            }
             instance_buffer_barriers.push(hal::BufferBarrier::<dyn hal::DynBuffer> {
                 buffer: tlas.instance_buffer.as_ref(),
                 usage: hal::StateTransition {
@@ -497,15 +501,10 @@ pub(crate) fn build_acceleration_structures(
                         to: BufferUses::COPY_DST,
                     },
                 }]);
-                let temp = hal::BufferCopy {
-                    src_offset: range.start as u64,
-                    dst_offset: offset,
-                    size,
-                };
                 raw_encoder.copy_buffer_to_buffer(
                     staging_buffer.as_ref().unwrap().raw(),
                     tlas.instance_buffer.as_ref(),
-                    &[temp],
+                    uploads,
                 );
             }
         }

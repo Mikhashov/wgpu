@@ -2871,29 +2871,34 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
             }
         });
 
+        fn core_instance(
+            instance: &Option<crate::TlasInstance>,
+        ) -> Option<wgc::ray_tracing::TlasInstance<'_>> {
+            instance
+                .as_ref()
+                .map(|instance| wgc::ray_tracing::TlasInstance {
+                    blas_id: instance.blas.as_core().id,
+                    transform: &instance.transform,
+                    custom_data: instance.custom_data,
+                    mask: instance.mask,
+                })
+        }
         let tlas = tlas.into_iter().map(|e| {
-            let instances = e
-                .instances
-                .iter()
-                .map(|instance: &Option<crate::TlasInstance>| {
-                    instance
-                        .as_ref()
-                        .map(|instance| wgc::ray_tracing::TlasInstance {
-                            blas_id: instance.blas.as_core().id,
-                            transform: &instance.transform,
-                            custom_data: instance.custom_data,
-                            mask: instance.mask,
-                        })
-                });
             let (seq, dirty, rebuild) = e.changes.take();
+            let changed = dirty.clone().into_iter().flat_map(|range| {
+                e.instances[range.start as usize..range.end as usize]
+                    .iter()
+                    .map(core_instance)
+            });
             wgc::ray_tracing::TlasPackage {
                 tlas_id: e.inner.as_core().id,
-                instances: Box::new(instances),
+                instances: Box::new(e.instances.iter().map(core_instance)),
                 lowest_unmodified: e.lowest_unmodified,
                 changes: Some(wgc::ray_tracing::TlasChanges {
                     source: e.changes.id,
                     seq,
                     dirty,
+                    instances: Box::new(changed),
                 }),
                 rebuild,
             }

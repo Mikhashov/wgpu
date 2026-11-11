@@ -9,7 +9,7 @@
 // - ([non performance] extract function in build (rust function extraction with guards is a pain))
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
-use core::sync::atomic::Ordering;
+use core::{ops::Range, sync::atomic::Ordering};
 
 #[cfg(feature = "serde")]
 use macro_rules_attribute::apply;
@@ -337,7 +337,7 @@ pub struct TlasPackage<'a> {
     pub lowest_unmodified: u32,
     /// What changed since the caller's previous build of these instances, to
     /// convert and upload only that. `None` uploads every instance.
-    pub changes: Option<TlasChanges>,
+    pub changes: Option<TlasChanges<'a>>,
     /// Build from scratch even where the top level could be updated
     /// ([`wgt::AccelerationStructureUpdateMode::PreferUpdate`]).
     pub rebuild: bool,
@@ -345,25 +345,27 @@ pub struct TlasPackage<'a> {
 
 /// Which instances of a [`TlasPackage`] changed since the previous build
 /// call made with the same `source`.
-#[derive(Debug, Clone)]
-pub struct TlasChanges {
+pub struct TlasChanges<'a> {
     /// The caller's object that tracks the changes of one list of instances
     /// (never 0, unique among them).
     pub source: u64,
     /// Build calls made with `source` before this one.
     pub seq: u32,
-    /// The instances (slots of [`TlasPackage::instances`]) that may differ
-    /// from the ones `source` passed in its previous call; the number of
-    /// slots never changes.
-    pub dirty: core::ops::Range<u32>,
+    /// The slots of [`TlasPackage::instances`] that may differ from the ones
+    /// `source` passed in its previous call, as ranges in ascending order
+    /// that do not overlap; the number of slots never changes.
+    pub dirty: Vec<Range<u32>>,
+    /// The instances of the `dirty` slots, in that order.
+    pub instances: Box<dyn Iterator<Item = Option<TlasInstance<'a>>> + 'a>,
 }
 
 /// What one recorded build of a top level uploads and refers to.
 #[derive(Debug)]
 pub struct TlasBuildData {
-    /// Hal instances to upload, and where in the instance buffer.
+    /// Hal instances to upload: where in the instance buffer each part of
+    /// `bytes` goes.
     pub(crate) bytes: Vec<u8>,
-    pub(crate) offset: u64,
+    pub(crate) uploads: Vec<(u64, Range<usize>)>,
     /// Instances in the whole top level.
     pub(crate) instance_count: u32,
     pub(crate) dependencies: Arc<Vec<Arc<Blas>>>,
@@ -388,8 +390,11 @@ pub(crate) struct TlasRetained {
     /// Each slot's bottom level and hal instance bytes.
     slots: Vec<Option<Arc<Blas>>>,
     bytes: Vec<u8>,
-    /// Slots holding an instance, and their bottom levels in order.
+    /// Slots holding an instance.
     count: u32,
+    /// The bottom levels in use, each once: with the number of slots using
+    /// them by address, and as the list builds refer to.
+    uses: crate::FastHashMap<usize, (Arc<Blas>, u32)>,
     dependencies: Arc<Vec<Arc<Blas>>>,
 }
 
@@ -398,7 +403,7 @@ impl TlasRetained {
         self.slots.len()
     }
 
-    /// Takes `instances` as the slots from `first` on (`partial`), or as
+    /// Takes `instances` as the slots of the `dirty` ranges in order, or as
     /// every slot, and returns the build that brings the instance buffer of
     /// `tlas` from the last recorded build's contents to these: an update of
     /// the structure that build left where `update` allows one and the
@@ -406,31 +411,38 @@ impl TlasRetained {
     pub(crate) fn apply(
         &mut self,
         tlas: &Tlas,
-        first: usize,
+        dirty: Option<&[Range<u32>]>,
         instances: &[Option<ArcTlasInstance>],
-        partial: bool,
         update: bool,
     ) -> TlasBuildData {
         let count_before = self.count;
         let stride = tlas.device.alignments.raw_tlas_instance_size as usize;
+        let partial = dirty.is_some();
         if !partial {
             self.slots.clear();
             self.slots.resize(instances.len(), None);
             self.bytes.clear();
             self.bytes.resize(instances.len() * stride, 0);
             self.count = 0;
+            self.uses.clear();
         }
+        let every = [0..instances.len() as u32];
+        let ranges = dirty.unwrap_or(&every);
+
         // Whether the instances after these move in the buffer (it holds no
-        // empty slots), and whether the list of bottom levels changes.
+        // empty slots), and whether the set of bottom levels changes.
         let mut moved = !partial;
         let mut relinked = !partial;
         // An instance without a bottom level's address is inactive, and
         // becoming active or inactive takes a build.
         let mut inactive = false;
-        for (slot, instance) in (first..).zip(instances) {
-            let was = &mut self.slots[slot];
-            match instance {
-                Some(instance) => {
+        let mut rest = instances;
+        for range in ranges {
+            let (changed, after) = rest.split_at(range.len().min(rest.len()));
+            rest = after;
+            for (slot, instance) in (range.start as usize..).zip(changed) {
+                let blas = instance.as_ref().map(|instance| &instance.blas);
+                if let Some(instance) = instance {
                     let bytes = tlas.device.raw().tlas_instance_to_bytes(hal::TlasInstance {
                         transform: instance.transform,
                         custom_data: instance.custom_data,
@@ -440,39 +452,73 @@ impl TlasRetained {
                     });
                     self.bytes[slot * stride..][..stride].copy_from_slice(&bytes);
                     inactive |= instance.blas.handle == 0;
-                    match was {
-                        Some(blas) if Arc::ptr_eq(blas, &instance.blas) => {}
-                        Some(_) => relinked = true,
-                        None => {
-                            moved = true;
-                            self.count += 1;
-                        }
-                    }
-                    *was = Some(instance.blas.clone());
                 }
-                None => {
-                    if was.take().is_some() {
+                let was = &mut self.slots[slot];
+                match (was.as_ref(), blas) {
+                    (Some(was), Some(blas)) if Arc::ptr_eq(was, blas) => continue,
+                    (Some(_), None) => {
                         moved = true;
                         self.count -= 1;
                     }
+                    (None, Some(_)) => {
+                        moved = true;
+                        self.count += 1;
+                    }
+                    _ => {}
+                }
+                // The bottom levels in use, counted by their instances.
+                if let Some(was) = was.take() {
+                    let key = Arc::as_ptr(&was) as usize;
+                    let uses = self.uses.get_mut(&key).expect("a slot's bottom level is counted");
+                    uses.1 -= 1;
+                    if uses.1 == 0 {
+                        self.uses.remove(&key);
+                        relinked = true;
+                    }
+                }
+                if let Some(blas) = blas {
+                    let uses = self
+                        .uses
+                        .entry(Arc::as_ptr(blas) as usize)
+                        .or_insert_with(|| {
+                            relinked = true;
+                            (blas.clone(), 0)
+                        });
+                    uses.1 += 1;
+                    *was = Some(blas.clone());
                 }
             }
         }
-        if moved || relinked {
-            self.dependencies = Arc::new(self.slots.iter().flatten().cloned().collect());
+        if relinked {
+            self.dependencies = Arc::new(self.uses.values().map(|uses| uses.0.clone()).collect());
         }
 
-        let before = self.slots[..first].iter().flatten().count();
-        let end = if moved {
-            self.slots.len()
-        } else {
-            first + instances.len()
-        };
-        let mut bytes = Vec::with_capacity((end - first) * stride);
-        for slot in first..end {
-            if self.slots[slot].is_some() {
-                bytes.extend_from_slice(&self.bytes[slot * stride..][..stride]);
+        // The changed slots' instances, or everything from the first of them
+        // on where instances moved, as they lie in the instance buffer.
+        let rest_of_buffer = [ranges.first().map_or(0, |range| range.start)..self.slots.len() as u32];
+        let spans = if moved { &rest_of_buffer[..] } else { ranges };
+        let full = self.count as usize == self.slots.len();
+        let mut bytes = Vec::new();
+        let mut uploads = Vec::new();
+        let (mut at, mut before) = (0, 0);
+        for span in spans {
+            let (start, end) = (span.start as usize, span.end as usize);
+            before += if full {
+                start - at
+            } else {
+                self.slots[at..start].iter().flatten().count()
+            };
+            let from = bytes.len();
+            for slot in start..end {
+                if self.slots[slot].is_some() {
+                    bytes.extend_from_slice(&self.bytes[slot * stride..][..stride]);
+                }
             }
+            if bytes.len() > from {
+                uploads.push(((before * stride) as u64, from..bytes.len()));
+            }
+            before += (bytes.len() - from) / stride;
+            at = end;
         }
 
         // An update keeps the number of instances (Vulkan: `primitiveCount`
@@ -484,7 +530,7 @@ impl TlasRetained {
         self.serial = tlas.build_serial.fetch_add(1, Ordering::Relaxed) + 1;
         TlasBuildData {
             bytes,
-            offset: (before * stride) as u64,
+            uploads,
             instance_count: self.count,
             dependencies: self.dependencies.clone(),
             serial: self.serial,

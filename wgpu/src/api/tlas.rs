@@ -33,35 +33,59 @@ pub struct Tlas {
 pub(crate) struct Changes {
     /// Unique to the object: a clone has instances of its own.
     pub(crate) id: u64,
-    /// Builds so far, the first and one past the last changed instance, and
-    /// whether the next build is from scratch.
-    state: Mutex<(u32, u32, u32, bool)>,
+    /// Builds so far, the changed instances as marked (ranges in any order),
+    /// and whether the next build is from scratch.
+    state: Mutex<(u32, Vec<Range<u32>>, bool)>,
 }
+
+/// Ranges of changed instances kept apart; past it they become one range
+/// from the first to the last of them.
+const MAX_CHANGES: usize = 4096;
 
 impl Changes {
     pub(crate) fn new() -> Self {
         static NEXT_ID: crate::cmp::AtomicU64 = crate::cmp::AtomicU64::new(1);
         Self {
             id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            state: Mutex::new((0, u32::MAX, 0, false)),
+            state: Mutex::new((0, Vec::new(), false)),
         }
     }
 
     fn mark(&self, range: Range<usize>) {
+        let range = range.start as u32..range.end as u32;
         let mut state = self.state.lock();
-        state.1 = state.1.min(range.start as u32);
-        state.2 = state.2.max(range.end as u32);
+        let changed = &mut state.1;
+        if range.is_empty() || changed.last() == Some(&range) {
+            return;
+        }
+        if changed.len() == MAX_CHANGES {
+            let start = changed.iter().map(|range| range.start).min().unwrap();
+            let end = changed.iter().map(|range| range.end).max().unwrap();
+            changed.clear();
+            changed.push(start..end);
+        }
+        changed.push(range);
     }
 
     /// The number of builds before this one, the instances changed since
-    /// the last and whether to build from scratch; none count as changed
-    /// after it.
+    /// the last (ranges in ascending order that do not overlap) and whether
+    /// to build from scratch; none count as changed after it.
     #[cfg_attr(not(wgpu_core), expect(dead_code))]
-    pub(crate) fn take(&self) -> (u32, Range<u32>, bool) {
+    pub(crate) fn take(&self) -> (u32, Vec<Range<u32>>, bool) {
         let mut state = self.state.lock();
-        let (seq, start, end, rebuild) = *state;
-        *state = (seq.wrapping_add(1), u32::MAX, 0, false);
-        (seq, start.min(end)..end, rebuild)
+        let seq = state.0;
+        state.0 = seq.wrapping_add(1);
+        let rebuild = core::mem::take(&mut state.2);
+        let mut marked = core::mem::take(&mut state.1);
+        marked.sort_unstable_by_key(|range| range.start);
+        let mut changed: Vec<Range<u32>> = Vec::with_capacity(marked.len());
+        for range in marked {
+            match changed.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => changed.push(range),
+            }
+        }
+        (seq, changed, rebuild)
     }
 }
 
@@ -142,7 +166,7 @@ impl Tlas {
     /// [`AccelerationStructureUpdateMode::PreferUpdate`]: wgt::AccelerationStructureUpdateMode::PreferUpdate
     /// [`AccelerationStructureFlags::ALLOW_UPDATE`]: wgt::AccelerationStructureFlags::ALLOW_UPDATE
     pub fn rebuild_next(&mut self) {
-        self.changes.state.lock().3 = true;
+        self.changes.state.lock().2 = true;
     }
 
     /// Get a reference to all instances.
@@ -234,18 +258,32 @@ impl IndexMut<Range<usize>> for Tlas {
 
 #[cfg(test)]
 mod tests {
-    use super::Changes;
+    use super::{Changes, MAX_CHANGES};
+    use alloc::vec;
 
     #[test]
     fn changes_cover_the_marked_instances_until_taken() {
         let changes = Changes::new();
         // Nothing marked: an empty range, and the builds count up.
-        assert_eq!(changes.take(), (0, 0..0, false));
+        assert_eq!(changes.take(), (0, vec![], false));
+        // Apart, twice the same, touching and overlapping ranges.
+        changes.mark(7..8);
         changes.mark(7..8);
         changes.mark(3..5);
-        changes.state.lock().3 = true;
-        assert_eq!(changes.take(), (1, 3..8, true));
-        assert_eq!(changes.take(), (2, 0..0, false));
+        changes.mark(5..6);
+        changes.mark(20..30);
+        changes.mark(25..40);
+        changes.state.lock().2 = true;
+        assert_eq!(changes.take(), (1, vec![3..6, 7..8, 20..40], true));
+        assert_eq!(changes.take(), (2, vec![], false));
+        // Too many to keep apart: one range over them all.
+        for slot in 0..2 * MAX_CHANGES {
+            changes.mark(2 * slot..2 * slot + 1);
+        }
+        let (_, ranges, _) = changes.take();
+        assert!(ranges.len() <= MAX_CHANGES);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges.last().unwrap().end, 4 * MAX_CHANGES as u32 - 1);
         // A clone tracks instances of its own.
         assert_ne!(changes.clone().id, changes.id);
         assert_eq!(changes.clone().take().0, 0);
