@@ -33,6 +33,10 @@ use wgt::Limits;
 /// - 52428 [`wgt::DrawIndexedIndirectArgs`]
 const BUFFER_SIZE: wgt::BufferSize = wgt::BufferSize::new(1_048_560).unwrap();
 
+/// Commands of one count draw per validation batch, so that a batch's
+/// metadata fits one metadata buffer of [`BUFFER_SIZE`].
+const METADATA_CHUNK: u32 = 1 << 14;
+
 /// Holds all device-level resources that are needed to validate indirect draws.
 ///
 /// This machinery requires the following limits:
@@ -199,6 +203,7 @@ impl Draw {
                 let usage = wgt::BufferUses::INDIRECT | wgt::BufferUses::STORAGE_READ_WRITE;
                 create_buffer_and_bind_group(
                     device,
+                    BUFFER_SIZE.get(),
                     usage,
                     self.dst_bind_group_layout.as_ref(),
                     hal_label(Some("(wgpu internal) Indirect draw validation destination buffer"), instance_flags),
@@ -206,6 +211,36 @@ impl Draw {
                 )
             }
         }
+    }
+
+    /// A destination buffer of at least `size` bytes (more than [`BUFFER_SIZE`]),
+    /// for the commands of one count draw, which must stay contiguous.
+    fn acquire_large_dst_entry(
+        &self,
+        device: &dyn hal::DynDevice,
+        instance_flags: wgt::InstanceFlags,
+        size: u64,
+    ) -> Result<BufferPoolEntry, hal::DeviceError> {
+        let mut free_buffers = self.free_indirect_entries.lock();
+        if let Some(index) = free_buffers.iter().position(|entry| entry.size >= size) {
+            return Ok(free_buffers.swap_remove(index));
+        }
+        let usage = wgt::BufferUses::INDIRECT | wgt::BufferUses::STORAGE_READ_WRITE;
+        create_buffer_and_bind_group(
+            device,
+            // Pooled and never shrunk: round up so a growing count reuses it.
+            size.next_power_of_two(),
+            usage,
+            self.dst_bind_group_layout.as_ref(),
+            hal_label(
+                Some("(wgpu internal) Indirect draw validation destination buffer"),
+                instance_flags,
+            ),
+            hal_label(
+                Some("(wgpu internal) Indirect draw validation destination bind group layout"),
+                instance_flags,
+            ),
+        )
     }
 
     fn release_dst_entries(&self, entries: impl Iterator<Item = BufferPoolEntry>) {
@@ -224,6 +259,7 @@ impl Draw {
                 let usage = wgt::BufferUses::COPY_DST | wgt::BufferUses::STORAGE_READ_ONLY;
                 create_buffer_and_bind_group(
                     device,
+                    BUFFER_SIZE.get(),
                     usage,
                     self.metadata_bind_group_layout.as_ref(),
                     hal_label(
@@ -730,12 +766,14 @@ fn calculate_src_offsets(
 
 #[derive(Debug)]
 struct BufferPoolEntry {
+    size: u64,
     buffer: Box<dyn hal::DynBuffer>,
     bind_group: Box<dyn hal::DynBindGroup>,
 }
 
 fn create_buffer_and_bind_group(
     device: &dyn hal::DynDevice,
+    size: u64,
     usage: wgt::BufferUses,
     bind_group_layout: &dyn hal::DynBindGroupLayout,
     buffer_label: Option<&'static str>,
@@ -743,7 +781,7 @@ fn create_buffer_and_bind_group(
 ) -> Result<BufferPoolEntry, hal::DeviceError> {
     let buffer_desc = hal::BufferDescriptor {
         label: buffer_label,
-        size: BUFFER_SIZE.get(),
+        size,
         usage,
         memory_flags: hal::MemoryFlags::empty(),
     };
@@ -760,7 +798,7 @@ fn create_buffer_and_bind_group(
         buffers: &[hal::BufferBinding::new_unchecked(
             buffer.as_ref(),
             0,
-            BUFFER_SIZE,
+            NonZeroU64::new(size).unwrap(),
         )],
         samplers: &[],
         textures: &[],
@@ -768,7 +806,11 @@ fn create_buffer_and_bind_group(
         external_textures: &[],
     };
     let bind_group = unsafe { device.create_bind_group(&bind_group_desc) }?;
-    Ok(BufferPoolEntry { buffer, bind_group })
+    Ok(BufferPoolEntry {
+        size,
+        buffer,
+        bind_group,
+    })
 }
 
 #[derive(Clone)]
@@ -839,6 +881,26 @@ impl DrawResources {
         };
         let entry_data = Self::get_subrange_impl(ensure_entry, current_entry, size)?;
         Ok((entry_data.index, entry_data.offset))
+    }
+
+    /// A destination buffer of its own for `size` bytes (more than [`BUFFER_SIZE`]).
+    fn get_large_dst(
+        &mut self,
+        size: u64,
+        current_entry: &mut Option<CurrentEntry>,
+    ) -> Result<(usize, u64), DeviceError> {
+        let indirect_draw_validation = &self.device.indirect_validation.as_ref().unwrap().draw;
+        let entry = indirect_draw_validation
+            .acquire_large_dst_entry(self.device.raw(), self.device.instance_flags, size)
+            .map_err(DeviceError::from_hal)?;
+        let index = self.dst_entries.len();
+        self.dst_entries.push(entry);
+        // Marks the buffer as full: the next subrange starts a new entry.
+        *current_entry = Some(CurrentEntry {
+            index,
+            offset: size.max(BUFFER_SIZE.get()),
+        });
+        Ok((index, 0))
     }
 
     fn get_metadata_subrange(
@@ -970,7 +1032,9 @@ impl DrawIndirectValidationBatch {
 
 /// Accumulates all needed data needed to validate indirect draws.
 pub(crate) struct DrawBatcher {
-    batches: FastHashMap<(TrackerIndex, u64, usize), DrawIndirectValidationBatch>,
+    /// Keyed by source buffer, its dynamic offset, destination buffer and
+    /// chunk of [`METADATA_CHUNK`] commands of one count draw (0 otherwise).
+    batches: FastHashMap<(TrackerIndex, u64, usize, u32), DrawIndirectValidationBatch>,
     current_dst_entry: Option<CurrentEntry>,
 }
 
@@ -1001,6 +1065,81 @@ impl DrawBatcher {
         let (dst_resource_index, dst_offset) = indirect_draw_validation_resources
             .get_dst_subrange(stride, &mut self.current_dst_entry)?;
 
+        self.push_entry(
+            device,
+            src_buffer,
+            offset,
+            dst_resource_index,
+            dst_offset,
+            0,
+            family,
+            vertex_or_index_limit,
+            instance_limit,
+        );
+
+        Ok((dst_resource_index, dst_offset))
+    }
+
+    /// Add the `count` commands of one count draw to be validated, contiguous
+    /// in one destination buffer (the count buffer counts from its start).
+    ///
+    /// Returns the index of the indirect buffer in `indirect_draw_validation_resources`
+    /// and the offset of the first command.
+    pub(crate) fn add_contiguous<'a>(
+        &mut self,
+        indirect_draw_validation_resources: &'a mut DrawResources,
+        device: &Device,
+        src_buffer: &Arc<crate::resource::Buffer>,
+        offset: u64,
+        count: u32,
+        family: crate::command::DrawCommandFamily,
+        vertex_or_index_limit: u64,
+        instance_limit: u64,
+    ) -> Result<(usize, u64), DeviceError> {
+        let dst_stride = crate::command::get_dst_stride_of_indirect_args(device.backend(), family);
+        let src_stride = get_src_stride_of_indirect_args(family);
+
+        let size = dst_stride * u64::from(count);
+        // Offsets in the validation shader are u32.
+        if size > u64::from(u32::MAX) {
+            return Err(DeviceError::OutOfMemory);
+        }
+        let (dst_resource_index, dst_offset) = if size <= BUFFER_SIZE.get() {
+            indirect_draw_validation_resources
+                .get_dst_subrange(size, &mut self.current_dst_entry)?
+        } else {
+            indirect_draw_validation_resources.get_large_dst(size, &mut self.current_dst_entry)?
+        };
+
+        for i in 0..count {
+            self.push_entry(
+                device,
+                src_buffer,
+                offset + src_stride * u64::from(i),
+                dst_resource_index,
+                dst_offset + dst_stride * u64::from(i),
+                i / METADATA_CHUNK,
+                family,
+                vertex_or_index_limit,
+                instance_limit,
+            );
+        }
+
+        Ok((dst_resource_index, dst_offset))
+    }
+
+    fn push_entry(
+        &mut self,
+        device: &Device,
+        src_buffer: &Arc<crate::resource::Buffer>,
+        offset: u64,
+        dst_resource_index: usize,
+        dst_offset: u64,
+        chunk: u32,
+        family: crate::command::DrawCommandFamily,
+        vertex_or_index_limit: u64,
+        instance_limit: u64,
+    ) {
         let buffer_size = src_buffer.size;
         let limits = device.adapter.limits();
         let data_size = get_src_stride_of_indirect_args(family);
@@ -1021,6 +1160,7 @@ impl DrawBatcher {
             src_buffer_tracker_index,
             src_dynamic_offset,
             dst_resource_index,
+            chunk,
         )) {
             hashbrown::hash_map::Entry::Occupied(mut occupied_entry) => {
                 occupied_entry.get_mut().entries.push(entry)
@@ -1040,8 +1180,6 @@ impl DrawBatcher {
                 });
             }
         }
-
-        Ok((dst_resource_index, dst_offset))
     }
 }
 

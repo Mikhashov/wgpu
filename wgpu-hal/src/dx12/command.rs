@@ -1475,10 +1475,33 @@ impl crate::CommandEncoder for super::CommandEncoder {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     ) {
-        unsafe { self.prepare_draw(0, 0) };
+        // As in the draws without a count: with indirect validation the
+        // commands carry their special constants.
+        if self
+            .pass
+            .layout
+            .special_constants
+            .as_ref()
+            .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
+            .is_some()
+        {
+            unsafe { self.prepare_vertex_buffers() };
+            self.update_root_elements();
+        } else {
+            unsafe { self.prepare_draw(0, 0) };
+        }
+
+        let cmd_signature = &self
+            .pass
+            .layout
+            .special_constants
+            .as_ref()
+            .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
+            .unwrap_or_else(|| &self.shared.cmd_signatures)
+            .draw;
         unsafe {
             self.list.as_ref().unwrap().ExecuteIndirect(
-                &self.shared.cmd_signatures.draw,
+                cmd_signature,
                 max_count,
                 &buffer.resource,
                 offset,
@@ -1495,10 +1518,33 @@ impl crate::CommandEncoder for super::CommandEncoder {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     ) {
-        unsafe { self.prepare_draw(0, 0) };
+        // As in the draws without a count: with indirect validation the
+        // commands carry their special constants.
+        if self
+            .pass
+            .layout
+            .special_constants
+            .as_ref()
+            .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
+            .is_some()
+        {
+            unsafe { self.prepare_vertex_buffers() };
+            self.update_root_elements();
+        } else {
+            unsafe { self.prepare_draw(0, 0) };
+        }
+
+        let cmd_signature = &self
+            .pass
+            .layout
+            .special_constants
+            .as_ref()
+            .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
+            .unwrap_or_else(|| &self.shared.cmd_signatures)
+            .draw_indexed;
         unsafe {
             self.list.as_ref().unwrap().ExecuteIndirect(
-                &self.shared.cmd_signatures.draw_indexed,
+                cmd_signature,
                 max_count,
                 &buffer.resource,
                 offset,

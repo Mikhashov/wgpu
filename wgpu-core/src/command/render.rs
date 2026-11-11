@@ -2565,6 +2565,7 @@ pub(super) fn encode_render_pass(
                     };
                     multi_draw_indirect_count(
                         &mut state,
+                        &mut indirect_draw_validation_batcher,
                         device,
                         buffer,
                         offset,
@@ -3423,6 +3424,7 @@ fn multi_draw_indirect(
 
 fn multi_draw_indirect_count(
     state: &mut State,
+    indirect_draw_validation_batcher: &mut crate::indirect_validation::DrawBatcher,
     device: &Arc<Device>,
     indirect_buffer: Arc<Buffer>,
     offset: u64,
@@ -3461,11 +3463,22 @@ fn multi_draw_indirect_count(
     indirect_buffer.same_device(device)?;
     count_buffer.same_device(device)?;
 
-    state
-        .pass
-        .scope
-        .buffers
-        .merge_single(&indirect_buffer, wgt::BufferUses::INDIRECT)?;
+    // D3D12 takes `first_instance` and the base vertex of an indirect command
+    // from special constants, which only the validation pass writes (into its
+    // own copy of the commands): count draws go through it there as well.
+    let validated = max_count != 0
+        && family != DrawCommandFamily::DrawMeshTasks
+        && device.backend() == wgt::Backend::Dx12
+        && device.indirect_validation.is_some();
+
+    state.pass.scope.buffers.merge_single(
+        &indirect_buffer,
+        if validated {
+            wgt::BufferUses::STORAGE_READ_ONLY
+        } else {
+            wgt::BufferUses::INDIRECT
+        },
+    )?;
 
     indirect_buffer.check_usage(BufferUsages::INDIRECT)?;
     let indirect_raw = indirect_buffer.try_raw(state.pass.base.snatch_guard)?;
@@ -3519,6 +3532,31 @@ fn multi_draw_indirect_count(
             MemoryInitKind::NeedsInitializedMemory,
         ),
     );
+
+    let (indirect_raw, offset) = if validated {
+        let (dst_index, dst_offset) = indirect_draw_validation_batcher.add_contiguous(
+            state.pass.base.indirect_draw_validation_resources,
+            device,
+            &indirect_buffer,
+            offset,
+            max_count,
+            family,
+            if family == DrawCommandFamily::DrawIndexed {
+                state.index.limit
+            } else {
+                state.vertex.limits.vertex_limit
+            },
+            state.vertex.limits.instance_limit,
+        )?;
+        let dst_buffer = state
+            .pass
+            .base
+            .indirect_draw_validation_resources
+            .get_dst_buffer(dst_index);
+        (dst_buffer, dst_offset)
+    } else {
+        (indirect_raw, offset)
+    };
 
     match family {
         DrawCommandFamily::Draw => unsafe {
