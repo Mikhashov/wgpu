@@ -33,8 +33,9 @@ pub struct Tlas {
 pub(crate) struct Changes {
     /// Unique to the object: a clone has instances of its own.
     pub(crate) id: u64,
-    /// Builds so far, and the first and one past the last changed instance.
-    state: Mutex<(u32, u32, u32)>,
+    /// Builds so far, the first and one past the last changed instance, and
+    /// whether the next build is from scratch.
+    state: Mutex<(u32, u32, u32, bool)>,
 }
 
 impl Changes {
@@ -42,7 +43,7 @@ impl Changes {
         static NEXT_ID: crate::cmp::AtomicU64 = crate::cmp::AtomicU64::new(1);
         Self {
             id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            state: Mutex::new((0, u32::MAX, 0)),
+            state: Mutex::new((0, u32::MAX, 0, false)),
         }
     }
 
@@ -52,14 +53,15 @@ impl Changes {
         state.2 = state.2.max(range.end as u32);
     }
 
-    /// The number of builds before this one and the instances changed since
-    /// the last; none count as changed after it.
+    /// The number of builds before this one, the instances changed since
+    /// the last and whether to build from scratch; none count as changed
+    /// after it.
     #[cfg_attr(not(wgpu_core), expect(dead_code))]
-    pub(crate) fn take(&self) -> (u32, Range<u32>) {
+    pub(crate) fn take(&self) -> (u32, Range<u32>, bool) {
         let mut state = self.state.lock();
-        let (seq, start, end) = *state;
-        *state = (seq.wrapping_add(1), u32::MAX, 0);
-        (seq, start.min(end)..end)
+        let (seq, start, end, rebuild) = *state;
+        *state = (seq.wrapping_add(1), u32::MAX, 0, false);
+        (seq, start.min(end)..end, rebuild)
     }
 }
 
@@ -129,6 +131,18 @@ impl Tlas {
     #[cfg(custom)]
     pub fn lowest_unmodified(&self) -> u32 {
         self.lowest_unmodified
+    }
+
+    /// Build this TLAS from scratch the next time it is built, even where it
+    /// would be updated ([`AccelerationStructureUpdateMode::PreferUpdate`]
+    /// with [`AccelerationStructureFlags::ALLOW_UPDATE`] and an unchanged
+    /// number of instances). Updates keep the structure's shape, so tracing
+    /// slows down as instances move away from where they were built.
+    ///
+    /// [`AccelerationStructureUpdateMode::PreferUpdate`]: wgt::AccelerationStructureUpdateMode::PreferUpdate
+    /// [`AccelerationStructureFlags::ALLOW_UPDATE`]: wgt::AccelerationStructureFlags::ALLOW_UPDATE
+    pub fn rebuild_next(&mut self) {
+        self.changes.state.lock().3 = true;
     }
 
     /// Get a reference to all instances.
@@ -226,11 +240,12 @@ mod tests {
     fn changes_cover_the_marked_instances_until_taken() {
         let changes = Changes::new();
         // Nothing marked: an empty range, and the builds count up.
-        assert_eq!(changes.take(), (0, 0..0));
+        assert_eq!(changes.take(), (0, 0..0, false));
         changes.mark(7..8);
         changes.mark(3..5);
-        assert_eq!(changes.take(), (1, 3..8));
-        assert_eq!(changes.take(), (2, 0..0));
+        changes.state.lock().3 = true;
+        assert_eq!(changes.take(), (1, 3..8, true));
+        assert_eq!(changes.take(), (2, 0..0, false));
         // A clone tracks instances of its own.
         assert_ne!(changes.clone().id, changes.id);
         assert_eq!(changes.clone().take().0, 0);

@@ -45,6 +45,8 @@ struct TlasStore<'a> {
     /// The instances' bytes in the staging buffer, and where they go in the instance buffer.
     range: Range<usize>,
     offset: u64,
+    /// Update the structure in place instead of building it.
+    update: bool,
 }
 
 impl Global {
@@ -174,16 +176,24 @@ impl Global {
                     // and the next build uploads every instance.
                     let mut retained = core::mem::take(&mut *tlas.retained.lock());
                     let changes = tlas_package.changes.filter(|_| !tracing);
-                    // The changed instances alone, where the instance buffer
-                    // will hold the caller's previous ones: the last build
-                    // recorded was that call's and has been submitted.
+                    // The last build recorded has been submitted: this one
+                    // runs on the instance buffer and the structure it left.
+                    let in_order = retained.serial != 0
+                        && retained.serial == tlas.submitted_serial.load(Ordering::Relaxed);
+                    let update = in_order
+                        && !tlas_package.rebuild
+                        && tlas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate
+                        && tlas
+                            .flags
+                            .contains(wgt::AccelerationStructureFlags::ALLOW_UPDATE);
+                    // The changed instances alone, where that build was the
+                    // caller's previous one.
                     let dirty = changes
                         .as_ref()
                         .filter(|changes| {
-                            changes.source == retained.source
+                            in_order
+                                && changes.source == retained.source
                                 && changes.seq == retained.seq.wrapping_add(1)
-                                && retained.serial != 0
-                                && retained.serial == tlas.submitted_serial.load(Ordering::Relaxed)
                                 && changes.dirty.end as usize <= retained.slots()
                         })
                         .map(|changes| {
@@ -210,7 +220,8 @@ impl Global {
                                 .transpose()
                         })
                         .collect::<Result<_, BuildAccelerationStructureError>>()?;
-                    let build = retained.apply(&tlas, taken.start, &instances, dirty.is_some());
+                    let build =
+                        retained.apply(&tlas, taken.start, &instances, dirty.is_some(), update);
                     (retained.source, retained.seq) =
                         changes.map_or((0, 0), |changes| (changes.source, changes.seq));
                     *tlas.retained.lock() = retained;
@@ -258,12 +269,6 @@ pub(crate) fn build_acceleration_structures(
         let tlas = &package.tlas;
         state.tracker.tlas_s.insert_single(tlas.clone());
 
-        let scratch_buffer_offset = scratch_buffer_tlas_size;
-        scratch_buffer_tlas_size = scratch_buffer_tlas_size.saturating_add(align_to(
-            tlas.size_info.build_scratch_size,
-            u64::from(state.device.alignments.ray_tracing_scratch_buffer_alignment),
-        ));
-
         let build = match package.build {
             Some(ref build) => build.clone(),
             // Not recorded by `command_encoder_build_acceleration_structures`
@@ -275,11 +280,22 @@ pub(crate) fn build_acceleration_structures(
                     0,
                     &package.instances,
                     false,
+                    false,
                 );
                 *tlas.retained.lock() = Default::default();
                 Arc::new(build)
             }
         };
+
+        let scratch_buffer_offset = scratch_buffer_tlas_size;
+        scratch_buffer_tlas_size = scratch_buffer_tlas_size.saturating_add(align_to(
+            if build.update {
+                tlas.size_info.update_scratch_size
+            } else {
+                tlas.size_info.build_scratch_size
+            },
+            u64::from(state.device.alignments.ray_tracing_scratch_buffer_alignment),
+        ));
 
         let first_byte_index = instance_buffer_staging_source.len();
         instance_buffer_staging_source.extend_from_slice(&build.bytes);
@@ -348,6 +364,7 @@ pub(crate) fn build_acceleration_structures(
             },
             range: first_byte_index..instance_buffer_staging_source.len(),
             offset: build.offset,
+            update: build.update,
         });
     }
 
@@ -381,15 +398,18 @@ pub(crate) fn build_acceleration_structures(
                 ref entries,
                 ref scratch_buffer_offset,
             },
+        update,
         ..
     } in &tlas_storage
     {
-        if tlas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate {
-            log::warn!("build_acceleration_structures called with PreferUpdate, but only rebuild is implemented");
-        }
         tlas_descriptors.push(hal::BuildAccelerationStructureDescriptor {
             entries,
-            mode: hal::AccelerationStructureBuildMode::Build,
+            // An update has no source: it is done in place.
+            mode: if update {
+                hal::AccelerationStructureBuildMode::Update
+            } else {
+                hal::AccelerationStructureBuildMode::Build
+            },
             flags: tlas.flags,
             source_acceleration_structure: None,
             destination_acceleration_structure: tlas.try_raw(state.snatch_guard)?,
@@ -455,6 +475,7 @@ pub(crate) fn build_acceleration_structures(
             internal: UnsafeTlasStore { ref tlas, .. },
             ref range,
             offset,
+            ..
         } in &tlas_storage
         {
             let size = match wgt::BufferSize::new((range.end - range.start) as u64) {

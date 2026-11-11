@@ -17,6 +17,7 @@ use crate::ray_tracing::acceleration_structure_limits;
 
 pub fn all_tests(tests: &mut Vec<GpuTestInitializer>) {
     tests.push(TLAS_PARTIAL_UPLOAD);
+    tests.push(TLAS_UPDATE);
 }
 
 /// Instance slots, and places along x a ray looks at (2 apart).
@@ -57,9 +58,26 @@ static TLAS_PARTIAL_UPLOAD: GpuTestConfiguration = GpuTestConfiguration::new()
             .limits(acceleration_structure_limits())
             .features(wgpu::Features::EXPERIMENTAL_RAY_QUERY),
     )
-    .run_async(tlas_partial_upload);
+    .run_async(|ctx| tlas_changes(ctx, false));
 
-async fn tlas_partial_upload(ctx: TestingContext) {
+/// The same changes on a top level that is updated in place where its
+/// number of instances stays, and built where it does not or on request.
+#[gpu_test]
+static TLAS_UPDATE: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(
+        TestParameters::default()
+            .test_features_limits()
+            .limits(acceleration_structure_limits())
+            .features(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+            // WARP's updated top level traces the instances where they were built.
+            .expect_fail(wgpu_test::FailureCase::backend_adapter(
+                wgpu::Backends::DX12,
+                "Microsoft Basic Render Driver",
+            )),
+    )
+    .run_async(|ctx| tlas_changes(ctx, true));
+
+async fn tlas_changes(ctx: TestingContext, update: bool) {
     let device = &ctx.device;
     let triangle: [[f32; 3]; 3] = [[-0.4, -0.4, 0.0], [0.4, -0.4, 0.0], [0.0, 0.4, 0.0]];
     let vertices = device.create_buffer_init(&BufferInitDescriptor {
@@ -104,8 +122,16 @@ async fn tlas_partial_upload(ctx: TestingContext) {
     let mut tlas = device.create_tlas(&CreateTlasDescriptor {
         label: None,
         max_instances: SLOTS as u32,
-        flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
-        update_mode: AccelerationStructureUpdateMode::Build,
+        flags: if update {
+            AccelerationStructureFlags::PREFER_FAST_TRACE | AccelerationStructureFlags::ALLOW_UPDATE
+        } else {
+            AccelerationStructureFlags::PREFER_FAST_TRACE
+        },
+        update_mode: if update {
+            AccelerationStructureUpdateMode::PreferUpdate
+        } else {
+            AccelerationStructureUpdateMode::Build
+        },
     });
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -200,6 +226,15 @@ async fn tlas_partial_upload(ctx: TestingContext) {
 
     // Nothing changes.
     assert_eq!(trace(&tlas, false).await, expected(&slots), "no change");
+
+    // Many instances move far, then a build from scratch.
+    for k in 30..50 {
+        slots[k] = Some((k + 34, k as u32));
+        tlas[k] = instance(&blas, k + 34, k as u32);
+    }
+    assert_eq!(trace(&tlas, false).await, expected(&slots), "many moves");
+    tlas.rebuild_next();
+    assert_eq!(trace(&tlas, false).await, expected(&slots), "a build on request");
 
     // An empty slot is taken and a taken one emptied: the instances after
     // them move in the instance buffer.

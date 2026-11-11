@@ -269,7 +269,7 @@ pub enum ValidateAsActionsError {
     #[error("Blas {0:?} is newer than the containing Tlas {1:?}")]
     BlasNewerThenTlas(ResourceErrorIdent, ResourceErrorIdent),
 
-    #[error("Tlas {0:?} was built with only its changed instances, and another build of it was submitted since that was recorded")]
+    #[error("Tlas {0:?} was updated or built with only its changed instances, and another build of it was submitted since that was recorded")]
     TlasBuiltOutOfOrder(ResourceErrorIdent),
 }
 
@@ -338,6 +338,9 @@ pub struct TlasPackage<'a> {
     /// What changed since the caller's previous build of these instances, to
     /// convert and upload only that. `None` uploads every instance.
     pub changes: Option<TlasChanges>,
+    /// Build from scratch even where the top level could be updated
+    /// ([`wgt::AccelerationStructureUpdateMode::PreferUpdate`]).
+    pub rebuild: bool,
 }
 
 /// Which instances of a [`TlasPackage`] changed since the previous build
@@ -366,9 +369,12 @@ pub struct TlasBuildData {
     pub(crate) dependencies: Arc<Vec<Arc<Blas>>>,
     /// Number of this build among the top level's recorded ones (from 1).
     pub(crate) serial: u64,
-    /// A build that uploads a part of the instances: the serial of the build
-    /// whose instances the buffer must hold when this one runs.
+    /// A build that uploads a part of the instances or updates the
+    /// structure: the serial of the build whose instances the buffer and
+    /// the structure must hold when this one runs.
     pub(crate) base: Option<u64>,
+    /// Update the structure in place instead of building it.
+    pub(crate) update: bool,
 }
 
 /// The instances of a top level as of its last recorded build.
@@ -394,14 +400,18 @@ impl TlasRetained {
 
     /// Takes `instances` as the slots from `first` on (`partial`), or as
     /// every slot, and returns the build that brings the instance buffer of
-    /// `tlas` from the last recorded build's contents to these.
+    /// `tlas` from the last recorded build's contents to these: an update of
+    /// the structure that build left where `update` allows one and the
+    /// number of instances stays.
     pub(crate) fn apply(
         &mut self,
         tlas: &Tlas,
         first: usize,
         instances: &[Option<ArcTlasInstance>],
         partial: bool,
+        update: bool,
     ) -> TlasBuildData {
+        let count_before = self.count;
         let stride = tlas.device.alignments.raw_tlas_instance_size as usize;
         if !partial {
             self.slots.clear();
@@ -414,6 +424,9 @@ impl TlasRetained {
         // empty slots), and whether the list of bottom levels changes.
         let mut moved = !partial;
         let mut relinked = !partial;
+        // An instance without a bottom level's address is inactive, and
+        // becoming active or inactive takes a build.
+        let mut inactive = false;
         for (slot, instance) in (first..).zip(instances) {
             let was = &mut self.slots[slot];
             match instance {
@@ -426,6 +439,7 @@ impl TlasRetained {
                         pipeline_intersection_data_offset: 0,
                     });
                     self.bytes[slot * stride..][..stride].copy_from_slice(&bytes);
+                    inactive |= instance.blas.handle == 0;
                     match was {
                         Some(blas) if Arc::ptr_eq(blas, &instance.blas) => {}
                         Some(_) => relinked = true,
@@ -461,7 +475,12 @@ impl TlasRetained {
             }
         }
 
-        let base = partial.then_some(self.serial);
+        // An update keeps the number of instances (Vulkan: `primitiveCount`
+        // as in the last build) and which of them are active; their
+        // transforms, masks, custom data and bottom levels may change. Empty
+        // slots are not written to the instance buffer at all.
+        let update = update && !inactive && self.count == count_before && self.count != 0;
+        let base = (partial || update).then_some(self.serial);
         self.serial = tlas.build_serial.fetch_add(1, Ordering::Relaxed) + 1;
         TlasBuildData {
             bytes,
@@ -470,6 +489,7 @@ impl TlasRetained {
             dependencies: self.dependencies.clone(),
             serial: self.serial,
             base,
+            update,
         }
     }
 }
