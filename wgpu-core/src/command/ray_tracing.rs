@@ -1,9 +1,5 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::{
-    cmp::max,
-    num::NonZeroU64,
-    ops::{Deref, Range},
-};
+use core::{cmp::max, num::NonZeroU64, ops::Range, sync::atomic::Ordering};
 
 use wgt::{math::align_to, BufferUsages, BufferUses, Features};
 
@@ -46,7 +42,9 @@ struct UnsafeTlasStore<'a> {
 
 struct TlasStore<'a> {
     internal: UnsafeTlasStore<'a>,
+    /// The instances' bytes in the staging buffer, and where they go in the instance buffer.
     range: Range<usize>,
+    offset: u64,
 }
 
 impl Global {
@@ -87,9 +85,13 @@ impl Global {
 
                 for tlas in tlas_ids {
                     let tlas = hub.tlas_s.get(*tlas).get()?;
+                    // Built outside wgpu: the instance buffer is not what was recorded.
                     build_command.tlas_s_built.push(TlasBuild {
                         tlas,
-                        dependencies: Vec::new(),
+                        dependencies: Arc::default(),
+                        uploaded: None,
+                        serial: 0,
+                        base: None,
                     });
                 }
 
@@ -111,6 +113,11 @@ impl Global {
 
         let cmd_enc = hub.command_encoders.get(command_encoder_id);
         let mut cmd_buf_data = cmd_enc.data.lock();
+        // A trace records every instance of a build.
+        #[cfg(feature = "trace")]
+        let tracing = cmd_enc.device.trace.lock().is_some();
+        #[cfg(not(feature = "trace"))]
+        let tracing = false;
 
         cmd_buf_data.push_with(|| -> Result<_, BuildAccelerationStructureError> {
             let blas = blas_iter
@@ -162,8 +169,33 @@ impl Global {
 
             let tlas = tlas_iter
                 .map(|tlas_package| {
-                    let instances = tlas_package
+                    let tlas = self.resolve_tlas_id(tlas_package.tlas_id)?;
+                    // Taken out for the time of the call: dropped by an error,
+                    // and the next build uploads every instance.
+                    let mut retained = core::mem::take(&mut *tlas.retained.lock());
+                    let changes = tlas_package.changes.filter(|_| !tracing);
+                    // The changed instances alone, where the instance buffer
+                    // will hold the caller's previous ones: the last build
+                    // recorded was that call's and has been submitted.
+                    let dirty = changes
+                        .as_ref()
+                        .filter(|changes| {
+                            changes.source == retained.source
+                                && changes.seq == retained.seq.wrapping_add(1)
+                                && retained.serial != 0
+                                && retained.serial == tlas.submitted_serial.load(Ordering::Relaxed)
+                                && changes.dirty.end as usize <= retained.slots()
+                        })
+                        .map(|changes| {
+                            let dirty = &changes.dirty;
+                            dirty.start as usize..dirty.end.max(dirty.start) as usize
+                        });
+                    let all = 0..usize::MAX;
+                    let taken = dirty.as_ref().unwrap_or(&all);
+                    let instances: Vec<_> = tlas_package
                         .instances
+                        .skip(taken.start)
+                        .take(taken.len())
                         .map(|instance| {
                             instance
                                 .as_ref()
@@ -178,10 +210,15 @@ impl Global {
                                 .transpose()
                         })
                         .collect::<Result<_, BuildAccelerationStructureError>>()?;
+                    let build = retained.apply(&tlas, taken.start, &instances, dirty.is_some());
+                    (retained.source, retained.seq) =
+                        changes.map_or((0, 0), |changes| (changes.source, changes.seq));
+                    *tlas.retained.lock() = retained;
                     Ok(ArcTlasPackage {
-                        tlas: self.resolve_tlas_id(tlas_package.tlas_id)?,
+                        tlas,
                         instances,
                         lowest_unmodified: tlas_package.lowest_unmodified,
+                        build: Some(Arc::new(build)),
                     })
                 })
                 .collect::<Result<_, BuildAccelerationStructureError>>()?;
@@ -227,11 +264,28 @@ pub(crate) fn build_acceleration_structures(
             u64::from(state.device.alignments.ray_tracing_scratch_buffer_alignment),
         ));
 
+        let build = match package.build {
+            Some(ref build) => build.clone(),
+            // Not recorded by `command_encoder_build_acceleration_structures`
+            // (a trace played): every instance, and nothing for a later
+            // build to upload a part against.
+            None => {
+                let build = crate::ray_tracing::TlasRetained::default().apply(
+                    tlas,
+                    0,
+                    &package.instances,
+                    false,
+                );
+                *tlas.retained.lock() = Default::default();
+                Arc::new(build)
+            }
+        };
+
         let first_byte_index = instance_buffer_staging_source.len();
+        instance_buffer_staging_source.extend_from_slice(&build.bytes);
 
-        let mut dependencies = Vec::new();
-
-        let mut instance_count = 0;
+        // The instances the build uploads; the others went through this with
+        // the build that uploaded them.
         for instance in package.instances.iter().flatten() {
             if instance.custom_data >= (1u32 << 24u32) {
                 return Err(BuildAccelerationStructureError::TlasInvalidCustomIndex(
@@ -240,16 +294,6 @@ pub(crate) fn build_acceleration_structures(
             }
             let blas = &instance.blas;
             state.tracker.blas_s.insert_single(blas.clone());
-
-            instance_buffer_staging_source.extend(state.device.raw().tlas_instance_to_bytes(
-                hal::TlasInstance {
-                    transform: instance.transform,
-                    custom_data: instance.custom_data,
-                    mask: instance.mask,
-                    blas_address: blas.handle,
-                    pipeline_intersection_data_offset: 0,
-                },
-            ));
 
             if tlas
                 .flags
@@ -265,16 +309,22 @@ pub(crate) fn build_acceleration_structures(
                     ),
                 );
             }
-
-            instance_count += 1;
-
-            dependencies.push(blas.clone());
         }
+        let instance_count = build.instance_count;
 
         build_command.tlas_s_built.push(TlasBuild {
             tlas: tlas.clone(),
-            dependencies,
+            dependencies: build.dependencies.clone(),
+            uploaded: build.base.is_some().then(|| {
+                let uploaded = package.instances.iter().flatten();
+                uploaded.map(|instance| instance.blas.clone()).collect()
+            }),
+            serial: build.serial,
+            base: build.base,
         });
+        state
+            .temp_resources
+            .push(TempResource::TlasDependencies(build.dependencies.clone()));
 
         if instance_count > tlas.max_instance_count {
             return Err(BuildAccelerationStructureError::TlasInstanceCountExceeded(
@@ -297,6 +347,7 @@ pub(crate) fn build_acceleration_structures(
                 scratch_buffer_offset,
             },
             range: first_byte_index..instance_buffer_staging_source.len(),
+            offset: build.offset,
         });
     }
 
@@ -403,6 +454,7 @@ pub(crate) fn build_acceleration_structures(
         for &TlasStore {
             internal: UnsafeTlasStore { ref tlas, .. },
             ref range,
+            offset,
         } in &tlas_storage
         {
             let size = match wgt::BufferSize::new((range.end - range.start) as u64) {
@@ -426,7 +478,7 @@ pub(crate) fn build_acceleration_structures(
                 }]);
                 let temp = hal::BufferCopy {
                     src_offset: range.start as u64,
-                    dst_offset: 0,
+                    dst_offset: offset,
                     size,
                 };
                 raw_encoder.copy_buffer_to_buffer(
@@ -472,6 +524,26 @@ impl CommandBufferMutable {
         snatch_guard: &SnatchGuard,
         command_index_guard: &mut RwLockWriteGuard<CommandIndices>,
     ) -> Result<(), ValidateAsActionsError> {
+        let result = self.validate_as_actions(snatch_guard, command_index_guard);
+        if result.is_err() {
+            // The builds will not run: no later one may upload a part of
+            // the instances against them.
+            for action in &self.as_actions {
+                if let AsAction::Build(build) = action {
+                    for tlas_build in &build.tlas_s_built {
+                        tlas_build.tlas.submitted_serial.store(0, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn validate_as_actions(
+        &self,
+        snatch_guard: &SnatchGuard,
+        command_index_guard: &mut RwLockWriteGuard<CommandIndices>,
+    ) -> Result<(), ValidateAsActionsError> {
         profiling::scope!("CommandEncoder::[submission]::validate_as_actions");
         for action in &self.as_actions {
             match action {
@@ -496,7 +568,20 @@ impl CommandBufferMutable {
                     }
 
                     for tlas_build in build.tlas_s_built.iter() {
-                        for blas in &tlas_build.dependencies {
+                        let tlas = &tlas_build.tlas;
+                        if tlas_build.base.is_some_and(|base| {
+                            base != tlas.submitted_serial.load(Ordering::Relaxed)
+                        }) {
+                            return Err(ValidateAsActionsError::TlasBuiltOutOfOrder(
+                                tlas.error_ident(),
+                            ));
+                        }
+                        tlas.submitted_serial
+                            .store(tlas_build.serial, Ordering::Relaxed);
+                        // The other bottom levels were checked with the
+                        // build that uploaded their instances.
+                        let uploaded = tlas_build.uploaded.as_deref();
+                        for blas in uploaded.unwrap_or(&tlas_build.dependencies) {
                             if blas.built_index.read().is_none() {
                                 return Err(ValidateAsActionsError::UsedUnbuiltBlas(
                                     blas.error_ident(),
@@ -505,11 +590,7 @@ impl CommandBufferMutable {
                             }
                         }
                         *tlas_build.tlas.built_index.write() = Some(build_command_index);
-                        tlas_build
-                            .tlas
-                            .dependencies
-                            .write()
-                            .clone_from(&tlas_build.dependencies)
+                        *tlas_build.tlas.dependencies.write() = tlas_build.dependencies.clone();
                     }
                 }
                 AsAction::UseTlas(tlas) => {
@@ -519,7 +600,7 @@ impl CommandBufferMutable {
                     if (*tlas_build_index).is_none() {
                         return Err(ValidateAsActionsError::UsedUnbuiltTlas(tlas.error_ident()));
                     }
-                    for blas in dependencies.deref() {
+                    for blas in dependencies.iter() {
                         let blas_build_index = *blas.built_index.read();
                         if blas_build_index.is_none() {
                             return Err(ValidateAsActionsError::UsedUnbuiltBlas(
@@ -560,7 +641,7 @@ impl CommandBufferMutable {
             match action {
                 AsAction::Build(build) => {
                     for tlas_build in build.tlas_s_built.iter() {
-                        for dependency in &tlas_build.dependencies {
+                        for dependency in tlas_build.dependencies.iter() {
                             if let Some(dependency) = dependency.raw(snatch_guard) {
                                 dependencies.push(dependency);
                             }

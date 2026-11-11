@@ -1281,6 +1281,7 @@ impl Player {
                 .map(|opt| opt.map(|inst| self.resolve_tlas_instance(inst)))
                 .collect(),
             lowest_unmodified: package.lowest_unmodified,
+            build: None,
         }
     }
 

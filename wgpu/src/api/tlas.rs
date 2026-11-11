@@ -1,4 +1,4 @@
-use crate::{api::blas::TlasInstance, dispatch};
+use crate::{api::blas::TlasInstance, dispatch, util::Mutex};
 use crate::{BindingResource, Label};
 use alloc::vec::Vec;
 #[cfg(wgpu_core)]
@@ -24,6 +24,50 @@ pub struct Tlas {
     pub(crate) inner: dispatch::DispatchTlas,
     pub(crate) instances: Vec<Option<TlasInstance>>,
     pub(crate) lowest_unmodified: u32,
+    pub(crate) changes: Changes,
+}
+
+/// The instances of a [`Tlas`] changed since the last build it was passed
+/// to: wgpu-core converts and uploads only those.
+#[derive(Debug)]
+pub(crate) struct Changes {
+    /// Unique to the object: a clone has instances of its own.
+    pub(crate) id: u64,
+    /// Builds so far, and the first and one past the last changed instance.
+    state: Mutex<(u32, u32, u32)>,
+}
+
+impl Changes {
+    pub(crate) fn new() -> Self {
+        static NEXT_ID: crate::cmp::AtomicU64 = crate::cmp::AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            state: Mutex::new((0, u32::MAX, 0)),
+        }
+    }
+
+    fn mark(&self, range: Range<usize>) {
+        let mut state = self.state.lock();
+        state.1 = state.1.min(range.start as u32);
+        state.2 = state.2.max(range.end as u32);
+    }
+
+    /// The number of builds before this one and the instances changed since
+    /// the last; none count as changed after it.
+    #[cfg_attr(not(wgpu_core), expect(dead_code))]
+    pub(crate) fn take(&self) -> (u32, Range<u32>) {
+        let mut state = self.state.lock();
+        let (seq, start, end) = *state;
+        *state = (seq.wrapping_add(1), u32::MAX, 0);
+        (seq, start.min(end)..end)
+    }
+}
+
+impl Clone for Changes {
+    /// Nothing was built from the clone yet: its first build takes every instance.
+    fn clone(&self) -> Self {
+        Self::new()
+    }
 }
 static_assertions::assert_impl_all!(Tlas: WasmNotSendSync);
 
@@ -106,6 +150,7 @@ impl Tlas {
         if range.end as u32 > self.lowest_unmodified {
             self.lowest_unmodified = range.end as u32;
         }
+        self.changes.mark(range.clone());
         Some(&mut self.instances[range])
     }
 
@@ -123,6 +168,7 @@ impl Tlas {
         if index as u32 + 1 > self.lowest_unmodified {
             self.lowest_unmodified = index as u32 + 1;
         }
+        self.changes.mark(index..index + 1);
         Some(&mut self.instances[index])
     }
 
@@ -156,6 +202,7 @@ impl IndexMut<usize> for Tlas {
         if index as u32 + 1 > self.lowest_unmodified {
             self.lowest_unmodified = index as u32 + 1;
         }
+        self.changes.mark(index..index + 1);
         idx
     }
 }
@@ -166,6 +213,26 @@ impl IndexMut<Range<usize>> for Tlas {
         if index.end > self.lowest_unmodified as usize {
             self.lowest_unmodified = index.end as u32;
         }
+        self.changes.mark(index);
         idx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Changes;
+
+    #[test]
+    fn changes_cover_the_marked_instances_until_taken() {
+        let changes = Changes::new();
+        // Nothing marked: an empty range, and the builds count up.
+        assert_eq!(changes.take(), (0, 0..0));
+        changes.mark(7..8);
+        changes.mark(3..5);
+        assert_eq!(changes.take(), (1, 3..8));
+        assert_eq!(changes.take(), (2, 0..0));
+        // A clone tracks instances of its own.
+        assert_ne!(changes.clone().id, changes.id);
+        assert_eq!(changes.clone().take().0, 0);
     }
 }

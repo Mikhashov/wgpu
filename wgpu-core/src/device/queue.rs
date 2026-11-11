@@ -330,6 +330,9 @@ pub type SubmittedWorkDoneClosure = Box<dyn FnOnce() + 'static>;
 pub enum TempResource {
     StagingBuffer(FlushedStagingBuffer),
     ScratchBuffer(ScratchBuffer),
+    /// The bottom levels of a top level built: a build that uploads only the
+    /// changed instances has the others in no tracker.
+    TlasDependencies(Arc<Vec<Arc<Blas>>>),
     DestroyedBuffer(DestroyedBuffer),
     DestroyedTexture(DestroyedTexture),
     DestroyedQuerySet(DestroyedQuerySet),

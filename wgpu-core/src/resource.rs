@@ -7,6 +7,10 @@ use core::{
     ops::Range,
     ptr::NonNull,
 };
+#[cfg(supports_64bit_atomics)]
+use core::sync::atomic::AtomicU64;
+#[cfg(not(supports_64bit_atomics))]
+use portable_atomic::AtomicU64;
 use smallvec::SmallVec;
 use thiserror::Error;
 use wgt::{
@@ -2681,7 +2685,16 @@ pub struct Tlas {
     pub(crate) flags: wgt::AccelerationStructureFlags,
     pub(crate) update_mode: wgt::AccelerationStructureUpdateMode,
     pub(crate) built_index: RwLock<Option<NonZeroU64>>,
-    pub(crate) dependencies: RwLock<Vec<Arc<Blas>>>,
+    pub(crate) dependencies: RwLock<Arc<Vec<Arc<Blas>>>>,
+    /// The instances as of the last recorded build, to upload only the changed ones.
+    pub(crate) retained: Mutex<crate::ray_tracing::TlasRetained>,
+    /// Serial of the last recorded build (see [`TlasBuildData`]).
+    ///
+    /// [`TlasBuildData`]: crate::ray_tracing::TlasBuildData
+    pub(crate) build_serial: AtomicU64,
+    /// Serial of the last submitted build, 0 where the instance buffer's
+    /// contents are not those of a recorded build.
+    pub(crate) submitted_serial: AtomicU64,
     pub(crate) instance_buffer: ManuallyDrop<Box<dyn hal::DynBuffer>>,
     /// The `label` from the descriptor used to create the resource.
     pub(crate) label: String,

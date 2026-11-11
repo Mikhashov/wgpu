@@ -1,5 +1,9 @@
 use alloc::{string::ToString as _, sync::Arc, vec::Vec};
 use core::mem::{size_of, ManuallyDrop};
+#[cfg(supports_64bit_atomics)]
+use core::sync::atomic::AtomicU64;
+#[cfg(not(supports_64bit_atomics))]
+use portable_atomic::AtomicU64;
 
 #[cfg(feature = "trace")]
 use crate::device::trace::{Action, IntoTrace};
@@ -288,7 +292,10 @@ impl Device {
             flags: desc.flags,
             update_mode: desc.update_mode,
             built_index: RwLock::new(rank::TLAS_BUILT_INDEX, None),
-            dependencies: RwLock::new(rank::TLAS_DEPENDENCIES, Vec::new()),
+            dependencies: RwLock::new(rank::TLAS_DEPENDENCIES, Arc::default()),
+            retained: Mutex::new(rank::TLAS_RETAINED, Default::default()),
+            build_serial: AtomicU64::new(0),
+            submitted_serial: AtomicU64::new(0),
             instance_buffer: ManuallyDrop::new(instance_buffer),
             label: desc.label.to_string(),
             max_instance_count: desc.max_instances,

@@ -9,6 +9,7 @@
 // - ([non performance] extract function in build (rust function extraction with guards is a pain))
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::sync::atomic::Ordering;
 
 #[cfg(feature = "serde")]
 use macro_rules_attribute::apply;
@@ -267,15 +268,19 @@ pub enum ValidateAsActionsError {
 
     #[error("Blas {0:?} is newer than the containing Tlas {1:?}")]
     BlasNewerThenTlas(ResourceErrorIdent, ResourceErrorIdent),
+
+    #[error("Tlas {0:?} was built with only its changed instances, and another build of it was submitted since that was recorded")]
+    TlasBuiltOutOfOrder(ResourceErrorIdent),
 }
 
 impl WebGpuError for ValidateAsActionsError {
     fn webgpu_error_type(&self) -> ErrorType {
         match self {
             Self::DestroyedResource(e) => e.webgpu_error_type(),
-            Self::UsedUnbuiltTlas(..) | Self::UsedUnbuiltBlas(..) | Self::BlasNewerThenTlas(..) => {
-                ErrorType::Validation
-            }
+            Self::UsedUnbuiltTlas(..)
+            | Self::UsedUnbuiltBlas(..)
+            | Self::BlasNewerThenTlas(..)
+            | Self::TlasBuiltOutOfOrder(..) => ErrorType::Validation,
         }
     }
 }
@@ -330,12 +335,156 @@ pub struct TlasPackage<'a> {
     pub tlas_id: TlasId,
     pub instances: Box<dyn Iterator<Item = Option<TlasInstance<'a>>> + 'a>,
     pub lowest_unmodified: u32,
+    /// What changed since the caller's previous build of these instances, to
+    /// convert and upload only that. `None` uploads every instance.
+    pub changes: Option<TlasChanges>,
+}
+
+/// Which instances of a [`TlasPackage`] changed since the previous build
+/// call made with the same `source`.
+#[derive(Debug, Clone)]
+pub struct TlasChanges {
+    /// The caller's object that tracks the changes of one list of instances
+    /// (never 0, unique among them).
+    pub source: u64,
+    /// Build calls made with `source` before this one.
+    pub seq: u32,
+    /// The instances (slots of [`TlasPackage::instances`]) that may differ
+    /// from the ones `source` passed in its previous call; the number of
+    /// slots never changes.
+    pub dirty: core::ops::Range<u32>,
+}
+
+/// What one recorded build of a top level uploads and refers to.
+#[derive(Debug)]
+pub struct TlasBuildData {
+    /// Hal instances to upload, and where in the instance buffer.
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) offset: u64,
+    /// Instances in the whole top level.
+    pub(crate) instance_count: u32,
+    pub(crate) dependencies: Arc<Vec<Arc<Blas>>>,
+    /// Number of this build among the top level's recorded ones (from 1).
+    pub(crate) serial: u64,
+    /// A build that uploads a part of the instances: the serial of the build
+    /// whose instances the buffer must hold when this one runs.
+    pub(crate) base: Option<u64>,
+}
+
+/// The instances of a top level as of its last recorded build.
+#[derive(Debug, Default)]
+pub(crate) struct TlasRetained {
+    /// [`TlasChanges::source`] and [`TlasChanges::seq`] of that build (0: none tracks them).
+    pub(crate) source: u64,
+    pub(crate) seq: u32,
+    /// [`TlasBuildData::serial`] of that build.
+    pub(crate) serial: u64,
+    /// Each slot's bottom level and hal instance bytes.
+    slots: Vec<Option<Arc<Blas>>>,
+    bytes: Vec<u8>,
+    /// Slots holding an instance, and their bottom levels in order.
+    count: u32,
+    dependencies: Arc<Vec<Arc<Blas>>>,
+}
+
+impl TlasRetained {
+    pub(crate) fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Takes `instances` as the slots from `first` on (`partial`), or as
+    /// every slot, and returns the build that brings the instance buffer of
+    /// `tlas` from the last recorded build's contents to these.
+    pub(crate) fn apply(
+        &mut self,
+        tlas: &Tlas,
+        first: usize,
+        instances: &[Option<ArcTlasInstance>],
+        partial: bool,
+    ) -> TlasBuildData {
+        let stride = tlas.device.alignments.raw_tlas_instance_size as usize;
+        if !partial {
+            self.slots.clear();
+            self.slots.resize(instances.len(), None);
+            self.bytes.clear();
+            self.bytes.resize(instances.len() * stride, 0);
+            self.count = 0;
+        }
+        // Whether the instances after these move in the buffer (it holds no
+        // empty slots), and whether the list of bottom levels changes.
+        let mut moved = !partial;
+        let mut relinked = !partial;
+        for (slot, instance) in (first..).zip(instances) {
+            let was = &mut self.slots[slot];
+            match instance {
+                Some(instance) => {
+                    let bytes = tlas.device.raw().tlas_instance_to_bytes(hal::TlasInstance {
+                        transform: instance.transform,
+                        custom_data: instance.custom_data,
+                        mask: instance.mask,
+                        blas_address: instance.blas.handle,
+                        pipeline_intersection_data_offset: 0,
+                    });
+                    self.bytes[slot * stride..][..stride].copy_from_slice(&bytes);
+                    match was {
+                        Some(blas) if Arc::ptr_eq(blas, &instance.blas) => {}
+                        Some(_) => relinked = true,
+                        None => {
+                            moved = true;
+                            self.count += 1;
+                        }
+                    }
+                    *was = Some(instance.blas.clone());
+                }
+                None => {
+                    if was.take().is_some() {
+                        moved = true;
+                        self.count -= 1;
+                    }
+                }
+            }
+        }
+        if moved || relinked {
+            self.dependencies = Arc::new(self.slots.iter().flatten().cloned().collect());
+        }
+
+        let before = self.slots[..first].iter().flatten().count();
+        let end = if moved {
+            self.slots.len()
+        } else {
+            first + instances.len()
+        };
+        let mut bytes = Vec::with_capacity((end - first) * stride);
+        for slot in first..end {
+            if self.slots[slot].is_some() {
+                bytes.extend_from_slice(&self.bytes[slot * stride..][..stride]);
+            }
+        }
+
+        let base = partial.then_some(self.serial);
+        self.serial = tlas.build_serial.fetch_add(1, Ordering::Relaxed) + 1;
+        TlasBuildData {
+            bytes,
+            offset: (before * stride) as u64,
+            instance_count: self.count,
+            dependencies: self.dependencies.clone(),
+            serial: self.serial,
+            base,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TlasBuild {
     pub tlas: Arc<Tlas>,
-    pub dependencies: Vec<Arc<Blas>>,
+    pub dependencies: Arc<Vec<Arc<Blas>>>,
+    /// The bottom levels of the instances this build uploaded, where those
+    /// are not all of `dependencies` (a build of a part).
+    pub uploaded: Option<Vec<Arc<Blas>>>,
+    /// [`TlasBuildData::serial`] and [`TlasBuildData::base`]; serial 0 for a
+    /// build wgpu did not record the instances of.
+    pub serial: u64,
+    pub base: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -424,8 +573,12 @@ pub type TraceTlasInstance = OwnedTlasInstance<IdReferences>;
 #[cfg_attr(feature = "serde", apply(serde_object_reference_struct))]
 pub struct OwnedTlasPackage<R: ReferenceType> {
     pub tlas: R::Tlas,
+    /// The instances: every slot, or with `build` the ones it uploads.
     pub instances: Vec<Option<OwnedTlasInstance<R>>>,
     pub lowest_unmodified: u32,
+    /// The build as recorded, `None` to upload `instances` as every slot.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub build: Option<Arc<TlasBuildData>>,
 }
 
 pub type TraceTlasPackage = OwnedTlasPackage<IdReferences>;

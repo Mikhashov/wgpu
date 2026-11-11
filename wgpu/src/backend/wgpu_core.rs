@@ -2885,10 +2885,16 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
                             mask: instance.mask,
                         })
                 });
+            let (seq, dirty) = e.changes.take();
             wgc::ray_tracing::TlasPackage {
                 tlas_id: e.inner.as_core().id,
                 instances: Box::new(instances),
                 lowest_unmodified: e.lowest_unmodified,
+                changes: Some(wgc::ray_tracing::TlasChanges {
+                    source: e.changes.id,
+                    seq,
+                    dirty,
+                }),
             }
         });
 
