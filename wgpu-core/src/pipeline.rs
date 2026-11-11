@@ -932,6 +932,10 @@ pub struct RenderPipeline {
     /// Whether this is a mesh shader pipeline
     pub(crate) is_mesh: bool,
     pub(crate) has_task_shader: bool,
+    /// Whether the vertex stage takes `vertex_index` or `instance_index`
+    /// (true where its interface is unknown): on D3D12 an indirect draw must
+    /// then come with its special constants (`multi_draw_indirect_count`).
+    pub(crate) reads_draw_index: bool,
 }
 
 impl Drop for RenderPipeline {
@@ -1009,6 +1013,7 @@ impl RenderPipeline {
             label,
             is_mesh: false,
             has_task_shader: false,
+            reads_draw_index: true,
         })
     }
 

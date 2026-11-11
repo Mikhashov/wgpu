@@ -1,6 +1,8 @@
 //! Every command of `multi_draw_indexed_indirect_count` gets its own
-//! `first_instance` and `base_vertex` (D3D12 takes them from special
-//! constants, which the indirect validation pass writes).
+//! `first_instance` and `base_vertex`: in `instance_index` and `vertex_index`
+//! (D3D12 takes those from special constants, which the indirect validation
+//! pass writes), and in what instance-rate and per-vertex buffers are read
+//! at (D3D12 does that natively, so such a pipeline keeps the native path).
 
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu_test::{
@@ -11,6 +13,8 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
     vec.extend(&[
         MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUILTINS,
         MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUILTINS_LARGE,
+        MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUFFERS,
+        MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUFFERS_LARGE,
     ]);
 }
 
@@ -26,6 +30,12 @@ struct Out {
     let corner = vec2<f32>(f32((v % 10u) & 1u), f32((v % 10u) >> 1u)) * 4.0 - 1.0;
     return Out(vec4<f32>(corner, 0.5, 1.0), vec2<u32>(i, v));
 }
+// The same from an instance-rate and a per-vertex buffer of 0, 1, 2, ...: no
+// built-in is read.
+@vertex fn vs_buffers(@location(0) i: u32, @location(1) v: u32) -> Out {
+    let corner = vec2<f32>(f32((v % 10u) & 1u), f32((v % 10u) >> 1u)) * 4.0 - 1.0;
+    return Out(vec4<f32>(corner, 0.5, 1.0), vec2<u32>(i, v));
+}
 @fragment fn fs(in: Out) -> @location(0) vec4<f32> {
     atomicMax(&seen[in.ids.x], in.ids.y + 1u);
     return vec4<f32>(0.0);
@@ -33,8 +43,10 @@ struct Out {
 "#;
 
 /// Draws `max_count` commands, the last four of which draw one instance each
-/// (first instance 5, 8, 11, 14; base vertex 0, 10, 20, 30); the rest are empty.
-async fn run(ctx: TestingContext, max_count: u32) {
+/// (first instance 5, 8, 11, 14; base vertex 0, 10, 20, 30); the rest are
+/// empty. With `buffers` the instance and the vertex come from vertex
+/// buffers instead of the built-ins.
+async fn run(ctx: TestingContext, max_count: u32, buffers: bool) {
     let device = &ctx.device;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: None,
@@ -45,9 +57,24 @@ async fn run(ctx: TestingContext, max_count: u32) {
         layout: None,
         vertex: wgpu::VertexState {
             module: &shader,
-            entry_point: Some("vs"),
+            entry_point: Some(if buffers { "vs_buffers" } else { "vs" }),
             compilation_options: Default::default(),
-            buffers: &[],
+            buffers: if buffers {
+                &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 4,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![0 => Uint32],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 4,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![1 => Uint32],
+                    }),
+                ]
+            } else {
+                &[]
+            },
         },
         primitive: Default::default(),
         depth_stencil: None,
@@ -76,6 +103,8 @@ async fn run(ctx: TestingContext, max_count: u32) {
         bytemuck::cast_slice(&[0u32, 1, 2]),
         wgpu::BufferUsages::INDEX,
     );
+    let identity: Vec<u32> = (0..64).collect();
+    let stream = init(bytemuck::cast_slice(&identity), wgpu::BufferUsages::VERTEX);
     let mut commands = vec![0u32; 5 * (max_count as usize - 4)];
     commands.extend((0..4u32).flat_map(|k| [3, 1, 0, 10 * k, 5 + 3 * k]));
     let commands = init(
@@ -134,6 +163,10 @@ async fn run(ctx: TestingContext, max_count: u32) {
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bindings, &[]);
         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+        if buffers {
+            pass.set_vertex_buffer(0, stream.slice(..));
+            pass.set_vertex_buffer(1, stream.slice(..));
+        }
         pass.multi_draw_indexed_indirect_count(&commands, 0, &count, 0, max_count);
     }
     encoder.copy_buffer_to_buffer(&seen, 0, &readback, 0, 64 * 4);
@@ -172,11 +205,25 @@ fn parameters() -> TestParameters {
 static MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUILTINS: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(parameters())
-        .run_async(|ctx| run(ctx, 4));
+        .run_async(|ctx| run(ctx, 4, false));
 
 /// More commands than one buffer of the indirect validation holds on D3D12.
 #[gpu_test]
 static MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUILTINS_LARGE: GpuTestConfiguration =
     GpuTestConfiguration::new()
         .parameters(parameters())
-        .run_async(|ctx| run(ctx, 40_000));
+        .run_async(|ctx| run(ctx, 40_000, false));
+
+/// A vertex stage that reads no built-in: the commands' first instance and
+/// base vertex reach the vertex buffers (on D3D12 without the validation pass).
+#[gpu_test]
+static MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUFFERS: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(parameters())
+        .run_async(|ctx| run(ctx, 4, true));
+
+#[gpu_test]
+static MULTI_DRAW_INDEXED_INDIRECT_COUNT_BUFFERS_LARGE: GpuTestConfiguration =
+    GpuTestConfiguration::new()
+        .parameters(parameters())
+        .run_async(|ctx| run(ctx, 40_000, true));

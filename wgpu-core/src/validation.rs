@@ -1365,6 +1365,23 @@ impl Interface {
 
     /// Among other things, this implements some validation logic defined by the WebGPU spec. at
     /// <https://www.w3.org/TR/webgpu/#abstract-opdef-validating-inter-stage-interfaces>.
+    /// Whether the entry point takes `vertex_index` or `instance_index`.
+    /// D3D12 does not add a draw's first vertex and first instance to them:
+    /// the HLSL backend adds special constants, which an indirect draw gets
+    /// only from wgpu-core's copy of its commands (indirect validation).
+    /// An entry point not found counts as taking them.
+    pub(crate) fn reads_draw_index(&self, stage: naga::ShaderStage, entry_point_name: &str) -> bool {
+        let pair = (stage, entry_point_name.to_string());
+        self.entry_points.get(&pair).is_none_or(|entry_point| {
+            entry_point.inputs.iter().any(|input| {
+                matches!(
+                    *input,
+                    Varying::BuiltIn(BuiltIn::VertexIndex | BuiltIn::InstanceIndex)
+                )
+            })
+        })
+    }
+
     pub fn check_stage(
         &self,
         layouts: &mut BindingLayoutSource,
@@ -2051,5 +2068,52 @@ impl ShaderStageForValidation {
             Self::Compute => wgt::ShaderStages::COMPUTE,
             Self::Task => wgt::ShaderStages::TASK,
         }
+    }
+}
+
+#[cfg(all(test, feature = "wgsl"))]
+mod tests {
+    use super::Interface;
+
+    #[test]
+    fn reads_draw_index_follows_the_vertex_entry_points_built_ins() {
+        let source = r#"
+            struct Draw {
+                @location(0) position: vec3<f32>,
+                @builtin(instance_index) instance: u32,
+            }
+            @vertex fn instance(@builtin(instance_index) i: u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(f32(i));
+            }
+            @vertex fn in_a_struct(draw: Draw) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(draw.position, f32(draw.instance));
+            }
+            @vertex fn vertex(@builtin(vertex_index) v: u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(f32(v));
+            }
+            @vertex fn neither(@location(0) position: vec3<f32>, @location(1) i: u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(position, f32(i));
+            }
+            // A fragment stage's built-ins are not the draw's.
+            @fragment fn fragment(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {
+                return at;
+            }
+        "#;
+        let module = naga::front::wgsl::parse_str(source).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        let interface = Interface::new(&module, &info, wgt::Limits::default());
+        let reads = |name| interface.reads_draw_index(naga::ShaderStage::Vertex, name);
+        assert!(reads("instance"));
+        assert!(reads("in_a_struct"));
+        assert!(reads("vertex"));
+        assert!(!reads("neither"));
+        // An entry point the interface does not know counts as reading them.
+        assert!(reads("missing"));
+        assert!(!interface.reads_draw_index(naga::ShaderStage::Fragment, "fragment"));
     }
 }

@@ -3463,13 +3463,32 @@ fn multi_draw_indirect_count(
     indirect_buffer.same_device(device)?;
     count_buffer.same_device(device)?;
 
-    // D3D12 takes `first_instance` and the base vertex of an indirect command
-    // from special constants, which only the validation pass writes (into its
-    // own copy of the commands): count draws go through it there as well.
+    // D3D12 adds a command's first instance and base vertex to what the
+    // vertex buffers are read at, but not to `instance_index` and
+    // `vertex_index`: those take them from special constants, which only the
+    // validation pass writes (into its own copy of the commands). A count
+    // draw goes through it there when the pipeline bound now reads either;
+    // one that reads neither keeps the native path, whose cost does not grow
+    // with `max_count`.
+    let dx12 = device.backend() == wgt::Backend::Dx12;
     let validated = max_count != 0
         && family != DrawCommandFamily::DrawMeshTasks
-        && device.backend() == wgt::Backend::Dx12
-        && device.indirect_validation.is_some();
+        && dx12
+        && device.indirect_validation.is_some()
+        && state
+            .pipeline
+            .as_ref()
+            .is_none_or(|pipeline| pipeline.reads_draw_index);
+    if dx12 {
+        // The hal picks the command signature by it.
+        unsafe {
+            state
+                .pass
+                .base
+                .raw_encoder
+                .set_indirect_count_validated(validated);
+        }
+    }
 
     state.pass.scope.buffers.merge_single(
         &indirect_buffer,

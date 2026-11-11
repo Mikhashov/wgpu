@@ -1475,16 +1475,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     ) {
-        // As in the draws without a count: with indirect validation the
-        // commands carry their special constants.
-        if self
-            .pass
-            .layout
-            .special_constants
-            .as_ref()
-            .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
-            .is_some()
-        {
+        // wgpu-core's validated commands carry their special constants, as
+        // in the draws without a count; its own are plain, and a pipeline
+        // that reads no vertex or instance index needs none.
+        let validated = self.pass.count_validated;
+        if validated {
             unsafe { self.prepare_vertex_buffers() };
             self.update_root_elements();
         } else {
@@ -1497,6 +1492,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .special_constants
             .as_ref()
             .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
+            .filter(|_| validated)
             .unwrap_or_else(|| &self.shared.cmd_signatures)
             .draw;
         unsafe {
@@ -1518,16 +1514,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     ) {
-        // As in the draws without a count: with indirect validation the
-        // commands carry their special constants.
-        if self
-            .pass
-            .layout
-            .special_constants
-            .as_ref()
-            .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
-            .is_some()
-        {
+        // wgpu-core's validated commands carry their special constants, as
+        // in the draws without a count; its own are plain, and a pipeline
+        // that reads no vertex or instance index needs none.
+        let validated = self.pass.count_validated;
+        if validated {
             unsafe { self.prepare_vertex_buffers() };
             self.update_root_elements();
         } else {
@@ -1540,6 +1531,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
             .special_constants
             .as_ref()
             .and_then(|sc| sc.indirect_cmd_signatures.as_ref())
+            .filter(|_| validated)
             .unwrap_or_else(|| &self.shared.cmd_signatures)
             .draw_indexed;
         unsafe {
@@ -1552,6 +1544,9 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 count_offset,
             )
         }
+    }
+    unsafe fn set_indirect_count_validated(&mut self, validated: bool) {
+        self.pass.count_validated = validated;
     }
     unsafe fn draw_mesh_tasks_indirect_count(
         &mut self,

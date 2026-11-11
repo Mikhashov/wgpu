@@ -4239,6 +4239,7 @@ impl Device {
 
         let mut io = validation::StageIo::default();
         let mut validated_stages = wgt::ShaderStages::empty();
+        let mut reads_draw_index = true;
 
         let mut vertex_steps;
         let mut hal_vertex_buffer_layouts;
@@ -4659,6 +4660,8 @@ impl Device {
                         .map_err(stage_err)?;
 
                     if let Some(interface) = vertex_shader_module.interface.interface() {
+                        reads_draw_index = interface
+                            .reads_draw_index(stage.to_naga(), &_vertex_entry_point_name);
                         immediate_slots_required |= interface
                             .immediate_slots_required(stage.to_naga(), &_vertex_entry_point_name);
                         io = interface
@@ -5073,6 +5076,7 @@ impl Device {
             tracking_data: TrackingData::new(self.tracker_indices.render_pipelines.clone()),
             is_mesh,
             has_task_shader,
+            reads_draw_index,
         };
 
         let pipeline = Arc::new(pipeline);

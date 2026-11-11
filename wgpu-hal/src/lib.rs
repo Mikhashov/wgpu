@@ -1712,6 +1712,12 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     );
+    /// Whether the commands of the following `draw_indirect_count` and
+    /// `draw_indexed_indirect_count` calls of this pass are wgpu-core's
+    /// validated copies. D3D12 lays those out with each command's special
+    /// constants in front and needs another command signature for them; the
+    /// other backends take the same commands either way.
+    unsafe fn set_indirect_count_validated(&mut self, _validated: bool) {}
     unsafe fn draw_mesh_tasks(
         &mut self,
         group_count_x: u32,

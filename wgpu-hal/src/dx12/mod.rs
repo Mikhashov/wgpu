@@ -944,6 +944,9 @@ struct PassState {
     vertex_buffers: [Direct3D12::D3D12_VERTEX_BUFFER_VIEW; crate::MAX_VERTEX_BUFFERS],
     dirty_vertex_buffers: usize,
     kind: PassKind,
+    /// Count draws take wgpu-core's validated commands, each with its
+    /// special constants in front (`set_indirect_count_validated`).
+    count_validated: bool,
 }
 
 // `root_elements` size must match `dirty_root_elements` bit size
@@ -968,6 +971,7 @@ impl PassState {
             vertex_buffers: [Default::default(); crate::MAX_VERTEX_BUFFERS],
             dirty_vertex_buffers: 0,
             kind: PassKind::Transfer,
+            count_validated: false,
         }
     }
 

@@ -178,6 +178,7 @@ pub trait DynCommandEncoder: DynResource + core::fmt::Debug {
         count_offset: wgt::BufferAddress,
         max_count: u32,
     );
+    unsafe fn set_indirect_count_validated(&mut self, validated: bool);
 
     unsafe fn begin_compute_pass(&mut self, desc: &ComputePassDescriptor<dyn DynQuerySet>);
     unsafe fn end_compute_pass(&mut self);
@@ -580,6 +581,10 @@ impl<C: CommandEncoder + DynResource> DynCommandEncoder for C {
                 max_count,
             )
         };
+    }
+
+    unsafe fn set_indirect_count_validated(&mut self, validated: bool) {
+        unsafe { C::set_indirect_count_validated(self, validated) };
     }
 
     unsafe fn draw_mesh_tasks_indirect_count(
