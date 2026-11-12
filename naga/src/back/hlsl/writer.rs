@@ -67,6 +67,25 @@ pub(super) struct EpStructMember {
     pub(super) index: u32,
 }
 
+/// The length of a `@builtin(clip_distances)` array, which the entry point
+/// output struct declares as one `floatN`.
+fn clip_distance_count(
+    module: &Module,
+    binding: &Option<crate::Binding>,
+    ty: Handle<crate::Type>,
+) -> Option<u32> {
+    match (binding, &module.types[ty].inner) {
+        (
+            &Some(crate::Binding::BuiltIn(crate::BuiltIn::ClipDistances)),
+            &TypeInner::Array {
+                size: crate::ArraySize::Constant(count),
+                ..
+            },
+        ) => Some(count.get()),
+        _ => None,
+    }
+}
+
 /// Structure contains information required for generating
 /// wrapped structure of all entry points arguments
 pub(super) struct EntryPointBinding {
@@ -698,7 +717,19 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
             if let Some(ref binding) = m.binding {
                 self.write_modifier(binding)?;
             }
-            self.write_type(module, m.ty)?;
+            match clip_distance_count(module, &m.binding, m.ty) {
+                // D3D takes clip distances as components of at most two
+                // registers, and an array would take a register per element.
+                Some(1) => write!(self.out, "float")?,
+                Some(count @ 2..=4) => write!(self.out, "float{count}")?,
+                Some(_) => {
+                    // shortcut: one register, upgrade to a second `SV_ClipDistance1` member when a shader needs 5..8.
+                    return Err(Error::Unimplemented(
+                        "more than 4 clip distances".to_string(),
+                    ));
+                }
+                None => self.write_type(module, m.ty)?,
+            }
             write!(self.out, " {}", &m.name)?;
             self.write_semantic(&m.binding, Some(shader_stage))?;
             writeln!(self.out, ";")?;
@@ -2315,7 +2346,23 @@ impl<'a, W: fmt::Write> super::Writer<'a, W> {
                                     write!(self.out, ", ")?;
                                 }
                                 let member_name = &self.names[&NameKey::StructMember(ty, m.index)];
-                                write!(self.out, "{variable_name}.{member_name}")?;
+                                match clip_distance_count(module, &m.binding, m.ty) {
+                                    Some(count @ 2..) => {
+                                        write!(self.out, "float{count}(")?;
+                                        for i in 0..count {
+                                            let sep = if i == 0 { "" } else { ", " };
+                                            write!(
+                                                self.out,
+                                                "{sep}{variable_name}.{member_name}[{i}]"
+                                            )?;
+                                        }
+                                        write!(self.out, ")")?;
+                                    }
+                                    Some(_) => {
+                                        write!(self.out, "{variable_name}.{member_name}[0]")?
+                                    }
+                                    None => write!(self.out, "{variable_name}.{member_name}")?,
+                                }
                             }
                             writeln!(self.out, " }};")?;
                             final_name

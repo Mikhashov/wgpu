@@ -459,6 +459,7 @@ impl super::Adapter {
         // these should always be available on d3d12
         let mut features = wgt::Features::empty()
             | wgt::Features::DEPTH_CLIP_CONTROL
+            | wgt::Features::CLIP_DISTANCES
             | wgt::Features::DEPTH32FLOAT_STENCIL8
             | wgt::Features::INDIRECT_FIRST_INSTANCE
             | wgt::Features::MAPPABLE_PRIMARY_BUFFERS
