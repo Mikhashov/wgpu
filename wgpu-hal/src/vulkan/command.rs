@@ -963,6 +963,16 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn insert_debug_marker(&mut self, label: &str) {
+        if let Some(ext) = &self.device.extension_fns.diagnostic_checkpoints {
+            if let Some(id) = label
+                .strip_prefix(super::DIAGNOSTIC_CHECKPOINT_PREFIX)
+                .and_then(|value| value.parse::<core::num::NonZeroUsize>().ok())
+            {
+                // SAFETY: the command buffer is recording. Vulkan treats the
+                // checkpoint identifier as opaque and never dereferences it.
+                unsafe { ext.cmd_set_checkpoint(self.active, core::ptr::without_provenance(id.get())) };
+            }
+        }
         if let Some(ext) = self.device.extension_fns.debug_utils.as_ref() {
             let cstr = self.temp.make_c_str(label);
             let vk_label = vk::DebugUtilsLabelEXT::default().label_name(cstr);

@@ -321,6 +321,7 @@ enum ExtensionFn<T> {
 
 struct DeviceExtensionFunctions {
     debug_utils: Option<ext::debug_utils::Device>,
+    diagnostic_checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     draw_indirect_count: Option<khr::draw_indirect_count::Device>,
     timeline_semaphore: Option<ExtensionFn<khr::timeline_semaphore::Device>>,
     ray_tracing: Option<RayTracingDeviceExtensionFunctions>,
@@ -1127,6 +1128,10 @@ impl CommandEncoder {
         self.active
     }
 }
+
+/// A debug marker with this prefix and a nonzero decimal ID also records an
+/// NVIDIA diagnostic checkpoint, when the extension is enabled.
+pub const DIAGNOSTIC_CHECKPOINT_PREFIX: &str = "Kiln GPU checkpoint #";
 
 impl fmt::Debug for CommandEncoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

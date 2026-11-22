@@ -2902,6 +2902,9 @@ impl super::Adapter {
                 .map_err(super::map_host_device_oom_err)?
         };
 
+        let diagnostic_checkpoints = enabled_extensions
+            .contains(&ash::nv::device_diagnostic_checkpoints::NAME)
+            .then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&self.instance.raw, &raw_device));
         let shared = Arc::new(super::DeviceShared {
             raw: raw_device,
             family_index,
@@ -2913,6 +2916,7 @@ impl super::Adapter {
             enabled_extensions: enabled_extensions.into(),
             extension_fns: super::DeviceExtensionFunctions {
                 debug_utils: debug_utils_fn,
+                diagnostic_checkpoints,
                 draw_indirect_count: indirect_count_fn,
                 timeline_semaphore: timeline_semaphore_fn,
                 ray_tracing: ray_tracing_fns,
@@ -3000,6 +3004,14 @@ impl super::Adapter {
         callback: Option<Box<super::CreateDeviceCallback<'a>>>,
     ) -> Result<crate::OpenDevice<super::Api>, crate::DeviceError> {
         let mut enabled_extensions = self.required_device_extensions(features);
+        // Applications can opt into recording checkpoints via debug markers.
+        // Enabling the extension alone does not insert any markers.
+        if self
+            .phd_capabilities
+            .supports_extension(ash::nv::device_diagnostic_checkpoints::NAME)
+        {
+            enabled_extensions.push(ash::nv::device_diagnostic_checkpoints::NAME);
+        }
         let mut enabled_phd_features = self.physical_device_features(&enabled_extensions, features);
 
         let family_index = 0; //TODO
