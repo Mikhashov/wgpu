@@ -1022,7 +1022,7 @@ impl Buffer {
                         },
                     };
                     let mut pending_writes = queue.pending_writes.lock();
-                    let encoder = pending_writes.activate();
+                    let encoder = pending_writes.activate(device)?;
                     unsafe {
                         encoder.transition_buffers(&[transition_src, transition_dst]);
                         if self.size > 0 {
